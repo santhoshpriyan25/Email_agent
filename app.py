@@ -146,8 +146,7 @@ def get_gmail_service():
         auth_url, _ = flow.authorization_url(
             prompt='consent',
             access_type='offline',
-            include_granted_scopes='true',
-            code_challenge_method=None
+            include_granted_scopes='true'
         )
 
         st.warning("🔐 Gmail not connected. Please authorize to continue.")
