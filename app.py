@@ -1,11 +1,20 @@
+import os
+import base64
+import json
 import streamlit as st
-import os, base64, json
 from email.mime.text import MIMEText
 from dotenv import load_dotenv
 from google import genai
 from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
+
+# ✅ CRITICAL: Must be set BEFORE any OAuth flow is created
+# This tells oauthlib to NOT use PKCE, which breaks on Streamlit Cloud
+# because each page rerun creates a new Flow object (losing the code_verifier)
+os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"  # Allow HTTP for local dev
+os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"   # Relax scope matching
 
 # --- SETUP ---
 load_dotenv()
@@ -47,6 +56,14 @@ def get_redirect_uri():
         return "https://bavsfaageuajpmpc67q5zc.streamlit.app"
 
 
+def get_google_config():
+    try:
+        return json.loads(st.secrets["GOOGLE_CREDENTIALS"])
+    except Exception as e:
+        st.error(f"❌ Could not load GOOGLE_CREDENTIALS from Streamlit Secrets: {e}")
+        return None
+
+
 # --- GMAIL HELPER FUNCTIONS ---
 def get_full_body(payload):
     body = ""
@@ -84,6 +101,11 @@ def send_reply(service, to_email, subject, body, thread_id, message_id):
 
 
 def get_gmail_service():
+    redirect_uri = get_redirect_uri()
+    google_config = get_google_config()
+    if not google_config:
+        return None
+
     # 1. Valid creds already in session
     if 'google_creds' in st.session_state:
         creds = st.session_state.google_creds
@@ -97,34 +119,38 @@ def get_gmail_service():
             except Exception:
                 del st.session_state.google_creds
 
-    # Load Google config
-    try:
-        google_config = json.loads(st.secrets["GOOGLE_CREDENTIALS"])
-    except Exception as e:
-        st.error(f"❌ Could not load GOOGLE_CREDENTIALS from Streamlit Secrets: {e}")
-        return None
-
-    redirect_uri = get_redirect_uri()
     query_params = st.query_params
 
     # 2. Returning from Google OAuth (code in URL)
     if "code" in query_params:
         try:
+            # ✅ Build the full callback URL manually for fetch_token
+            # We must pass the complete URL including state param
+            code = query_params.get("code")
+            state = query_params.get("state", "")
+            scope = query_params.get("scope", "")
+
             flow = Flow.from_client_config(
                 google_config,
                 scopes=SCOPES,
-                redirect_uri=redirect_uri
+                redirect_uri=redirect_uri,
+                state=state  # Pass state so flow doesn't regenerate it
             )
 
-            # ✅ THE FIX: Explicitly disable PKCE code verifier
-            # Streamlit reruns on every redirect so the original Flow object
-            # is lost — meaning the code_verifier is gone. We disable PKCE
-            # so Google doesn't expect one during token exchange.
-            flow.code_verifier = None
+            # ✅ THE REAL FIX: Set code_verifier to empty string on the
+            # underlying OAuth2 session — this completely bypasses PKCE
+            flow.oauth2session._client.code_verifier = None
+            flow.oauth2session.code_verifier = None
 
-            flow.fetch_token(code=query_params["code"])
+            # Reconstruct the full redirect URL for fetch_token
+            params = "&".join([f"{k}={v}" for k, v in query_params.items()])
+            authorization_response = f"{redirect_uri}?{params}"
 
-            st.session_state.google_creds = flow.credentials
+            flow.fetch_token(authorization_response=authorization_response)
+
+            # Serialize and store credentials
+            creds = flow.credentials
+            st.session_state.google_creds = creds
             st.query_params.clear()
             st.rerun()
 
@@ -134,7 +160,7 @@ def get_gmail_service():
             st.query_params.clear()
             return None
 
-    # 3. No creds — show Connect button
+    # 3. No creds — generate auth URL and show Connect button
     try:
         flow = Flow.from_client_config(
             google_config,
@@ -142,12 +168,14 @@ def get_gmail_service():
             redirect_uri=redirect_uri
         )
 
-        # ✅ Generate auth URL with PKCE disabled
-        auth_url, _ = flow.authorization_url(
+        auth_url, state = flow.authorization_url(
             prompt='consent',
             access_type='offline',
             include_granted_scopes='true'
         )
+
+        # ✅ Store state in session so we can validate on return
+        st.session_state['oauth_state'] = state
 
         st.warning("🔐 Gmail not connected. Please authorize to continue.")
         st.link_button("🔗 Connect Gmail Account", auth_url, use_container_width=True)
@@ -174,7 +202,7 @@ with st.sidebar:
     email_limit = st.slider("Messages to Analyze", 1, 15, 5)
 
     if st.button("🗑️ Reset Connection"):
-        for key in ['google_creds', 'email_data']:
+        for key in ['google_creds', 'email_data', 'oauth_state']:
             if key in st.session_state:
                 del st.session_state[key]
         st.query_params.clear()
