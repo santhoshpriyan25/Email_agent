@@ -85,11 +85,6 @@ def send_reply(service, to_email, subject, body, thread_id, message_id):
 
 
 def get_gmail_service():
-    """
-    Web-based OAuth2 flow — works correctly on Streamlit Cloud.
-    Uses redirect URI instead of run_local_server (which only works locally).
-    """
-    # 1. Already have valid creds in session?
     if 'google_creds' in st.session_state:
         creds = st.session_state.google_creds
         if creds and creds.valid:
@@ -99,21 +94,18 @@ def get_gmail_service():
                 creds.refresh(Request())
                 st.session_state.google_creds = creds
                 return build('gmail', 'v1', credentials=creds)
-            except Exception as e:
-                st.warning(f"Token refresh failed ({e}). Re-authenticating...")
+            except Exception:
                 del st.session_state.google_creds
 
-    # Load Google config from secrets
     try:
         google_config = json.loads(st.secrets["GOOGLE_CREDENTIALS"])
     except Exception as e:
-        st.error(f"❌ Could not load GOOGLE_CREDENTIALS from Streamlit Secrets: {e}")
+        st.error(f"❌ Could not load GOOGLE_CREDENTIALS: {e}")
         return None
 
     redirect_uri = get_redirect_uri()
-
-    # 2. Returning from Google OAuth redirect? (URL contains ?code=...)
     query_params = st.query_params
+
     if "code" in query_params:
         try:
             flow = Flow.from_client_config(
@@ -121,28 +113,17 @@ def get_gmail_service():
                 scopes=SCOPES,
                 redirect_uri=redirect_uri
             )
-            # Reconstruct the full authorization response URL
-            # Streamlit gives us individual params, so we build the full URL
-            auth_response_params = dict(query_params)
-            # Build a fake full URL for fetch_token
-            base_url = redirect_uri.rstrip("/")
-            param_str = "&".join(f"{k}={v}" for k, v in auth_response_params.items())
-            authorization_response = f"{base_url}?{param_str}"
-
-            flow.fetch_token(authorization_response=authorization_response)
-            creds = flow.credentials
-            st.session_state.google_creds = creds
-
-            # Clear OAuth params from URL so page looks clean
+            # ✅ Pass code directly — avoids state mismatch & expiry issues
+            flow.fetch_token(code=query_params["code"])
+            st.session_state.google_creds = flow.credentials
             st.query_params.clear()
             st.rerun()
-
         except Exception as e:
             st.error(f"❌ OAuth callback failed: {e}")
             st.info("Please try connecting your Gmail account again.")
+            st.query_params.clear()  # ← Clear bad params so button reappears
             return None
 
-    # 3. No creds at all — show the Connect button
     try:
         flow = Flow.from_client_config(
             google_config,
