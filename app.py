@@ -7,16 +7,13 @@ from dotenv import load_dotenv
 from google import genai
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
+from requests_oauthlib import OAuth2Session
 
-# ✅ CRITICAL: Must be set BEFORE any OAuth flow is created
-# This tells oauthlib to NOT use PKCE, which breaks on Streamlit Cloud
-# because each page rerun creates a new Flow object (losing the code_verifier)
-os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"  # Allow HTTP for local dev
-os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"   # Relax scope matching
+# ✅ Must be set before any OAuth work
+os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 
-# --- SETUP ---
 load_dotenv()
 
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
@@ -26,45 +23,48 @@ SCOPES = [
     'https://www.googleapis.com/auth/gmail.send'
 ]
 
+GOOGLE_AUTH_URL  = "https://accounts.google.com/o/oauth2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+
 st.set_page_config(page_title="AI Command Center", page_icon="🛡️", layout="wide")
 
-# --- PREMIUM UI CSS ---
 st.markdown("""
     <style>
     .main { background: #0f172a; color: #f8fafc; }
     .stMetric { background: rgba(255,255,255,0.05); padding: 15px; border-radius: 12px; border: 1px solid #334155; }
     .email-card {
-        background: rgba(255, 255, 255, 0.03);
+        background: rgba(255,255,255,0.03);
         backdrop-filter: blur(10px);
-        border: 1px solid rgba(255, 255, 255, 0.1);
+        border: 1px solid rgba(255,255,255,0.1);
         border-radius: 16px; padding: 25px; margin-bottom: 20px;
     }
-    .priority-high { border-left: 5px solid #ef4444; }
+    .priority-high   { border-left: 5px solid #ef4444; }
     .priority-normal { border-left: 5px solid #3b82f6; }
-    .action-chip { background: rgba(52, 211, 153, 0.1); color: #34d399; padding: 5px 12px; border-radius: 20px; font-size: 0.85rem; font-weight: 600; }
-    .subject-header { font-weight: bold; font-size: 1.1rem; margin-bottom: 5px; }
+    .action-chip { background: rgba(52,211,153,0.1); color: #34d399; padding: 5px 12px; border-radius: 20px; font-size: 0.85rem; font-weight: 600; }
+    .subject-header  { font-weight: bold; font-size: 1.1rem; margin-bottom: 5px; }
     </style>
 """, unsafe_allow_html=True)
 
 
-# --- HELPER: Get redirect URI ---
-def get_redirect_uri():
-    try:
-        google_config = json.loads(st.secrets["GOOGLE_CREDENTIALS"])
-        return google_config["web"]["redirect_uris"][0]
-    except Exception:
-        return "https://bavsfaageuajpmpc67q5zc.streamlit.app"
+# ── helpers ──────────────────────────────────────────────────────────────────
 
-
-def get_google_config():
+def load_google_config():
     try:
         return json.loads(st.secrets["GOOGLE_CREDENTIALS"])
     except Exception as e:
-        st.error(f"❌ Could not load GOOGLE_CREDENTIALS from Streamlit Secrets: {e}")
+        st.error(f"❌ Cannot load GOOGLE_CREDENTIALS: {e}")
         return None
 
+def get_redirect_uri(cfg):
+    return cfg["web"]["redirect_uris"][0]
 
-# --- GMAIL HELPER FUNCTIONS ---
+def get_client_id(cfg):
+    return cfg["web"]["client_id"]
+
+def get_client_secret(cfg):
+    return cfg["web"]["client_secret"]
+
+
 def get_full_body(payload):
     body = ""
     if 'parts' in payload:
@@ -83,14 +83,14 @@ def get_full_body(payload):
 
 
 def send_reply(service, to_email, subject, body, thread_id, message_id):
-    message = MIMEText(body)
+    msg = MIMEText(body)
     if not subject.lower().startswith("re:"):
         subject = f"Re: {subject}"
-    message['to'] = to_email
-    message['subject'] = subject
-    message['In-Reply-To'] = message_id
-    message['References'] = message_id
-    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+    msg['to']           = to_email
+    msg['subject']      = subject
+    msg['In-Reply-To']  = message_id
+    msg['References']   = message_id
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     try:
         service.users().messages().send(
             userId='me', body={'raw': raw, 'threadId': thread_id}
@@ -100,57 +100,64 @@ def send_reply(service, to_email, subject, body, thread_id, message_id):
         return False
 
 
+# ── OAuth using requests-oauthlib directly (no PKCE) ─────────────────────────
+
 def get_gmail_service():
-    redirect_uri = get_redirect_uri()
-    google_config = get_google_config()
-    if not google_config:
+    cfg = load_google_config()
+    if not cfg:
         return None
 
-    # 1. Valid creds already in session
-    if 'google_creds' in st.session_state:
-        creds = st.session_state.google_creds
-        if creds and creds.valid:
-            return build('gmail', 'v1', credentials=creds)
-        if creds and creds.expired and creds.refresh_token:
-            try:
+    client_id     = get_client_id(cfg)
+    client_secret = get_client_secret(cfg)
+    redirect_uri  = get_redirect_uri(cfg)
+
+    # 1 ── already have valid credentials in session
+    if 'token' in st.session_state:
+        token = st.session_state.token
+        try:
+            creds = Credentials(
+                token=token['access_token'],
+                refresh_token=token.get('refresh_token'),
+                token_uri=GOOGLE_TOKEN_URL,
+                client_id=client_id,
+                client_secret=client_secret,
+                scopes=SCOPES
+            )
+            if creds.expired and creds.refresh_token:
                 creds.refresh(Request())
-                st.session_state.google_creds = creds
-                return build('gmail', 'v1', credentials=creds)
-            except Exception:
-                del st.session_state.google_creds
+                st.session_state.token['access_token'] = creds.token
+            return build('gmail', 'v1', credentials=creds)
+        except Exception:
+            del st.session_state['token']
 
     query_params = st.query_params
 
-    # 2. Returning from Google OAuth (code in URL)
+    # 2 ── returning from Google with ?code=...
     if "code" in query_params:
         try:
-            # ✅ Build the full callback URL manually for fetch_token
-            # We must pass the complete URL including state param
-            code = query_params.get("code")
-            state = query_params.get("state", "")
-            scope = query_params.get("scope", "")
+            saved_state = st.session_state.get('oauth_state')
 
-            flow = Flow.from_client_config(
-                google_config,
-                scopes=SCOPES,
+            # ✅ Use requests-oauthlib directly — zero PKCE involvement
+            oauth = OAuth2Session(
+                client_id=client_id,
                 redirect_uri=redirect_uri,
-                state=state  # Pass state so flow doesn't regenerate it
+                scope=SCOPES,
+                state=saved_state
             )
 
-            # ✅ THE REAL FIX: Set code_verifier to empty string on the
-            # underlying OAuth2 session — this completely bypasses PKCE
-            flow.oauth2session._client.code_verifier = None
-            flow.oauth2session.code_verifier = None
+            # Build the full callback URL from query params
+            params   = dict(query_params)
+            qs       = "&".join(f"{k}={v}" for k, v in params.items())
+            full_url = f"{redirect_uri}?{qs}"
 
-            # Reconstruct the full redirect URL for fetch_token
-            params = "&".join([f"{k}={v}" for k, v in query_params.items()])
-            authorization_response = f"{redirect_uri}?{params}"
+            token = oauth.fetch_token(
+                token_url=GOOGLE_TOKEN_URL,
+                authorization_response=full_url,
+                client_secret=client_secret,
+                include_client_id=True
+            )
 
-            flow.fetch_token(authorization_response=authorization_response)
-
-            # Serialize and store credentials
-            creds = flow.credentials
-            st.session_state.google_creds = creds
+            st.session_state.token = token
             st.query_params.clear()
             st.rerun()
 
@@ -160,41 +167,36 @@ def get_gmail_service():
             st.query_params.clear()
             return None
 
-    # 3. No creds — generate auth URL and show Connect button
-    try:
-        flow = Flow.from_client_config(
-            google_config,
-            scopes=SCOPES,
-            redirect_uri=redirect_uri
-        )
+    # 3 ── no credentials yet — show the Connect button
+    oauth = OAuth2Session(
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        scope=SCOPES
+    )
 
-        auth_url, state = flow.authorization_url(
-            prompt='consent',
-            access_type='offline',
-            include_granted_scopes='true'
-        )
+    auth_url, state = oauth.authorization_url(
+        GOOGLE_AUTH_URL,
+        access_type="offline",
+        prompt="consent"
+    )
 
-        # ✅ Store state in session so we can validate on return
-        st.session_state['oauth_state'] = state
+    st.session_state['oauth_state'] = state
 
-        st.warning("🔐 Gmail not connected. Please authorize to continue.")
-        st.link_button("🔗 Connect Gmail Account", auth_url, use_container_width=True)
-        st.stop()
-
-    except Exception as e:
-        st.error(f"❌ Failed to generate auth URL: {e}")
-        return None
+    st.warning("🔐 Gmail not connected. Please authorize to continue.")
+    st.link_button("🔗 Connect Gmail Account", auth_url, use_container_width=True)
+    st.stop()
 
 
-# --- APP INITIALIZATION ---
+# ── session init ──────────────────────────────────────────────────────────────
+
 if 'email_data' not in st.session_state:
     st.session_state.email_data = []
 
-# --- SIDEBAR ---
+# ── sidebar ───────────────────────────────────────────────────────────────────
+
 with st.sidebar:
     st.title("🛡️ AI Controls")
-
-    if 'google_creds' in st.session_state:
+    if 'token' in st.session_state:
         st.success("✅ Gmail Connected")
     else:
         st.warning("⚠️ Gmail Not Connected")
@@ -202,20 +204,19 @@ with st.sidebar:
     email_limit = st.slider("Messages to Analyze", 1, 15, 5)
 
     if st.button("🗑️ Reset Connection"):
-        for key in ['google_creds', 'email_data', 'oauth_state']:
-            if key in st.session_state:
-                del st.session_state[key]
+        for k in ['token', 'email_data', 'oauth_state']:
+            st.session_state.pop(k, None)
         st.query_params.clear()
         st.rerun()
 
-# --- MAIN TITLE & TABS ---
+# ── main UI ───────────────────────────────────────────────────────────────────
+
 st.title("🧠 Intelligence Command Center")
 tab1, tab2, tab3 = st.tabs(["📊 Analytics", "📬 Smart Digest", "🚀 Instant Reply"])
 
-# --- MAIN SYNC BUTTON ---
 if st.button("⚡ Run Full System Sync", use_container_width=True):
     if not GEMINI_API_KEY:
-        st.error("❌ Missing Gemini API Key. Please add GEMINI_API_KEY to your Streamlit Secrets.")
+        st.error("❌ Missing Gemini API Key in Streamlit Secrets.")
     else:
         try:
             service = get_gmail_service()
@@ -223,7 +224,7 @@ if st.button("⚡ Run Full System Sync", use_container_width=True):
                 client = genai.Client(api_key=GEMINI_API_KEY, http_options={'api_version': 'v1'})
 
                 with st.status("Gathering Intelligence...", expanded=True) as status:
-                    results = service.users().messages().list(
+                    results  = service.users().messages().list(
                         userId='me', q='is:unread', maxResults=email_limit
                     ).execute()
                     messages = results.get('messages', [])
@@ -232,54 +233,47 @@ if st.button("⚡ Run Full System Sync", use_container_width=True):
                         st.success("✅ Inbox is clear!")
                         st.session_state.email_data = []
                     else:
-                        processed = []
-                        context = ""
+                        processed, context = [], ""
 
                         for m in messages:
-                            msg = service.users().messages().get(userId='me', id=m['id']).execute()
-                            body = get_full_body(msg['payload'])
+                            msg     = service.users().messages().get(userId='me', id=m['id']).execute()
+                            body    = get_full_body(msg['payload'])
                             headers = msg['payload']['headers']
                             subject = next((h['value'] for h in headers if h['name'] == 'Subject'), "No Subject")
-                            sender = next((h['value'] for h in headers if h['name'] == 'From'), "Unknown")
-                            msg_id = next((h['value'] for h in headers if h['name'] == 'Message-ID'), "")
+                            sender  = next((h['value'] for h in headers if h['name'] == 'From'), "Unknown")
+                            msg_id  = next((h['value'] for h in headers if h['name'] == 'Message-ID'), "")
 
                             context += f"ID:{m['id']}\nFROM:{sender}\nSUBJ:{subject}\nBODY:{body[:800]}\n---\n"
                             processed.append({
-                                "id": m['id'],
-                                "threadId": m['threadId'],
-                                "messageId": msg_id,
-                                "sender": sender,
-                                "subject": subject
+                                "id": m['id'], "threadId": m['threadId'],
+                                "messageId": msg_id, "sender": sender, "subject": subject
                             })
 
                         try:
                             ai_resp = client.models.generate_content(
                                 model="gemini-2.0-flash",
                                 contents=(
-                                    f"Format each email EXACTLY like this and separate with the word SPLIT:\n"
-                                    f"PRIORITY: [High/Normal] | SUMMARY: [1 sentence] | ACTION: [1 step] | DRAFT: [2 sentence reply]\n\n"
+                                    "Format each email EXACTLY like this and separate with the word SPLIT:\n"
+                                    "PRIORITY: [High/Normal] | SUMMARY: [1 sentence] | ACTION: [1 step] | DRAFT: [2 sentence reply]\n\n"
                                     f"Emails:\n{context}"
                                 )
                             )
-
-                            entries = ai_resp.text.split("SPLIT")
-                            for i, entry in enumerate(entries):
+                            for i, entry in enumerate(ai_resp.text.split("SPLIT")):
                                 if i < len(processed) and "PRIORITY:" in entry:
                                     parts = entry.strip().split('|')
                                     if len(parts) >= 4:
                                         processed[i].update({
-                                            "prio": parts[0].replace("PRIORITY:", "").strip(),
-                                            "summary": parts[1].replace("SUMMARY:", "").strip(),
-                                            "action": parts[2].replace("ACTION:", "").strip(),
-                                            "draft": parts[3].replace("DRAFT:", "").strip(),
+                                            "prio":    parts[0].replace("PRIORITY:", "").strip(),
+                                            "summary": parts[1].replace("SUMMARY:",  "").strip(),
+                                            "action":  parts[2].replace("ACTION:",   "").strip(),
+                                            "draft":   parts[3].replace("DRAFT:",    "").strip(),
                                         })
-
                             st.session_state.email_data = processed
                             status.update(label="✅ Sync Complete!", state="complete")
 
                         except Exception as ai_err:
                             if "429" in str(ai_err):
-                                st.warning("⏱️ AI rate limit reached. Please wait 60 seconds and try again.")
+                                st.warning("⏱️ AI rate limit hit. Wait 60 s and try again.")
                             else:
                                 st.error(f"AI Error: {ai_err}")
                             status.update(label="Sync Paused", state="error")
@@ -287,12 +281,13 @@ if st.button("⚡ Run Full System Sync", use_container_width=True):
         except Exception as e:
             st.error(f"System Connection Error: {e}")
 
-# --- RENDER TABS ---
+# ── tabs ──────────────────────────────────────────────────────────────────────
+
 with tab1:
     if st.session_state.email_data:
         c1, c2, c3 = st.columns(3)
         c1.metric("Unread Analyzed", len(st.session_state.email_data))
-        c2.metric("Urgent Tasks", len([e for e in st.session_state.email_data if e.get('prio') == "High"]))
+        c2.metric("Urgent Tasks",    len([e for e in st.session_state.email_data if e.get('prio') == "High"]))
         c3.metric("Normal Priority", len([e for e in st.session_state.email_data if e.get('prio') == "Normal"]))
     else:
         st.info("Ready for sync. Click ⚡ Run Full System Sync above to get started.")
@@ -305,12 +300,11 @@ with tab2:
             p_class = "priority-high" if e['prio'] == "High" else "priority-normal"
             st.markdown(
                 f'<div class="email-card {p_class}">'
-                f'<div style="color:#94a3b8; font-size:0.85rem;">{e["sender"]}</div>'
+                f'<div style="color:#94a3b8;font-size:0.85rem;">{e["sender"]}</div>'
                 f'<div class="subject-header">{e["subject"]}</div>'
-                f'<div style="margin: 8px 0;">{e.get("summary", "")}</div>'
-                f'<span class="action-chip">🎯 {e.get("action", "")}</span>'
-                f'</div>',
-                unsafe_allow_html=True
+                f'<div style="margin:8px 0;">{e.get("summary","")}</div>'
+                f'<span class="action-chip">🎯 {e.get("action","")}</span>'
+                f'</div>', unsafe_allow_html=True
             )
 
 with tab3:
@@ -319,19 +313,14 @@ with tab3:
     for i, e in enumerate(st.session_state.email_data):
         if 'draft' in e:
             with st.expander(f"📩 Reply to: {e['subject']}"):
-                reply_text = st.text_area(
-                    "Edit AI Draft:", value=e['draft'], key=f"text_{i}", height=120
-                )
-                if st.button(f"🚀 Send Reply", key=f"btn_{i}"):
+                reply_text = st.text_area("Edit AI Draft:", value=e['draft'], key=f"text_{i}", height=120)
+                if st.button("🚀 Send Reply", key=f"btn_{i}"):
                     service = get_gmail_service()
-                    if service and send_reply(
-                        service, e['sender'], e['subject'],
-                        reply_text, e['threadId'], e['messageId']
-                    ):
+                    if service and send_reply(service, e['sender'], e['subject'],
+                                              reply_text, e['threadId'], e['messageId']):
                         st.success("✅ Reply sent!")
                         service.users().messages().batchModify(
-                            userId='me',
-                            body={'ids': [e['id']], 'removeLabelIds': ['UNREAD']}
+                            userId='me', body={'ids': [e['id']], 'removeLabelIds': ['UNREAD']}
                         ).execute()
                     else:
                         st.error("❌ Failed to send. Check Gmail permissions.")
