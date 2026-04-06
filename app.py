@@ -4,7 +4,6 @@ from email.mime.text import MIMEText
 from dotenv import load_dotenv
 from google import genai
 from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 
@@ -39,7 +38,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# --- HELPER: Get redirect URI from secrets ---
+# --- HELPER: Get redirect URI ---
 def get_redirect_uri():
     try:
         google_config = json.loads(st.secrets["GOOGLE_CREDENTIALS"])
@@ -48,7 +47,7 @@ def get_redirect_uri():
         return "https://bavsfaageuajpmpc67q5zc.streamlit.app"
 
 
-# --- GMAIL & HELPER FUNCTIONS ---
+# --- GMAIL HELPER FUNCTIONS ---
 def get_full_body(payload):
     body = ""
     if 'parts' in payload:
@@ -85,6 +84,7 @@ def send_reply(service, to_email, subject, body, thread_id, message_id):
 
 
 def get_gmail_service():
+    # 1. Valid creds already in session
     if 'google_creds' in st.session_state:
         creds = st.session_state.google_creds
         if creds and creds.valid:
@@ -97,15 +97,17 @@ def get_gmail_service():
             except Exception:
                 del st.session_state.google_creds
 
+    # Load Google config
     try:
         google_config = json.loads(st.secrets["GOOGLE_CREDENTIALS"])
     except Exception as e:
-        st.error(f"❌ Could not load GOOGLE_CREDENTIALS: {e}")
+        st.error(f"❌ Could not load GOOGLE_CREDENTIALS from Streamlit Secrets: {e}")
         return None
 
     redirect_uri = get_redirect_uri()
     query_params = st.query_params
 
+    # 2. Returning from Google OAuth (code in URL)
     if "code" in query_params:
         try:
             flow = Flow.from_client_config(
@@ -113,31 +115,45 @@ def get_gmail_service():
                 scopes=SCOPES,
                 redirect_uri=redirect_uri
             )
-            # ✅ Pass code directly — avoids state mismatch & expiry issues
+
+            # ✅ THE FIX: Explicitly disable PKCE code verifier
+            # Streamlit reruns on every redirect so the original Flow object
+            # is lost — meaning the code_verifier is gone. We disable PKCE
+            # so Google doesn't expect one during token exchange.
+            flow.code_verifier = None
+
             flow.fetch_token(code=query_params["code"])
+
             st.session_state.google_creds = flow.credentials
             st.query_params.clear()
             st.rerun()
+
         except Exception as e:
             st.error(f"❌ OAuth callback failed: {e}")
-            st.info("Please try connecting your Gmail account again.")
-            st.query_params.clear()  # ← Clear bad params so button reappears
+            st.info("Please click **Reset Connection** in the sidebar and try again.")
+            st.query_params.clear()
             return None
 
+    # 3. No creds — show Connect button
     try:
         flow = Flow.from_client_config(
             google_config,
             scopes=SCOPES,
             redirect_uri=redirect_uri
         )
+
+        # ✅ Generate auth URL with PKCE disabled
         auth_url, _ = flow.authorization_url(
             prompt='consent',
             access_type='offline',
-            include_granted_scopes='true'
+            include_granted_scopes='true',
+            code_challenge_method=None
         )
+
         st.warning("🔐 Gmail not connected. Please authorize to continue.")
         st.link_button("🔗 Connect Gmail Account", auth_url, use_container_width=True)
         st.stop()
+
     except Exception as e:
         st.error(f"❌ Failed to generate auth URL: {e}")
         return None
@@ -151,7 +167,6 @@ if 'email_data' not in st.session_state:
 with st.sidebar:
     st.title("🛡️ AI Controls")
 
-    # Show connection status
     if 'google_creds' in st.session_state:
         st.success("✅ Gmail Connected")
     else:
@@ -160,10 +175,9 @@ with st.sidebar:
     email_limit = st.slider("Messages to Analyze", 1, 15, 5)
 
     if st.button("🗑️ Reset Connection"):
-        if 'google_creds' in st.session_state:
-            del st.session_state.google_creds
-        if 'email_data' in st.session_state:
-            st.session_state.email_data = []
+        for key in ['google_creds', 'email_data']:
+            if key in st.session_state:
+                del st.session_state[key]
         st.query_params.clear()
         st.rerun()
 
@@ -238,7 +252,7 @@ if st.button("⚡ Run Full System Sync", use_container_width=True):
 
                         except Exception as ai_err:
                             if "429" in str(ai_err):
-                                st.warning("⏱️ **AI Overload:** Free-tier limit reached. Please wait 60 seconds and try again.")
+                                st.warning("⏱️ AI rate limit reached. Please wait 60 seconds and try again.")
                             else:
                                 st.error(f"AI Error: {ai_err}")
                             status.update(label="Sync Paused", state="error")
