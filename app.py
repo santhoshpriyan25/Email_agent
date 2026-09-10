@@ -251,7 +251,7 @@ if st.button("⚡ Run Full System Sync", use_container_width=True):
 
                         try:
                             ai_resp = client.models.generate_content(
-                                model="gemini-2.0-flash",
+                                model="gemini-3.6-flash",
                                 contents=(
                                     "Format each email EXACTLY like this and separate with the word SPLIT:\n"
                                     "PRIORITY: [High/Normal] | SUMMARY: [1 sentence] | ACTION: [1 step] | DRAFT: [2 sentence reply]\n\n"
